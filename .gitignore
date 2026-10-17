@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+data/*.sqlite3
+data/*.sqlite3-*
+# Generated export is committed deliberately once built from live data:
+# data/export/companies.jsonl, data/export/dataset_stats.json, data/export/benchmark.json
