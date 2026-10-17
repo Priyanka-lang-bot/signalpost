@@ -1,0 +1,51 @@
+{
+  "generated_at": "2026-10-17T12:54:54+00:00",
+  "offline": {
+    "mode": "offline (synthetic fixtures, in-memory store)",
+    "checks": {
+      "identity: A resolves to A": true,
+      "identity: similar name B kept separate": true,
+      "identity: branch not merged into parent": true,
+      "roles: leadership extracted, auditor kept as separate entity": true,
+      "not found handled": true,
+      "410 removal handled": true,
+      "invalid input rejected": true,
+      "identity: mismatched payload rejected": true,
+      "update: employee change detected": true,
+      "update: unchanged run reports no changes": true,
+      "financials: other company's accounts discarded": true,
+      "financials: non-numeric value rejected": true
+    },
+    "passed": 12,
+    "total": 12,
+    "evidence_completeness": 1.0,
+    "explanation_grounding": 1.0
+  },
+  "entity_fields_mapped": 37,
+  "live": {
+    "mode": "live (real registry, fresh in-memory store, no cache)",
+    "sample_size": 50,
+    "outcomes": {
+      "ok": 50
+    },
+    "identity_accuracy": 1.0,
+    "mean_field_coverage": 0.855,
+    "coverage_fields": [
+      "name",
+      "legal_form",
+      "business_address",
+      "industry_code",
+      "registration_date",
+      "registered_employees",
+      "roles",
+      "financials.revenue"
+    ],
+    "evidence_completeness": 1.0,
+    "explanation_grounding": 1.0,
+    "outbound_requests": 150,
+    "requests_per_company": 3.0,
+    "elapsed_seconds": 35.03,
+    "seconds_per_company": 0.701,
+    "external_api_cost_usd_measured": 0.0
+  }
+}

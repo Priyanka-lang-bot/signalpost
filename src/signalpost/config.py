@@ -11,7 +11,7 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-def _load_dotenv(path: Path = Path(".env")) -> None:
+def _load_dotenv(path: Path = Path(".env")) -> None:  # noqa: D401
     """Minimal .env loader (KEY=VALUE lines) so no extra dependency is needed."""
     if not path.is_file():
         return
@@ -20,7 +20,8 @@ def _load_dotenv(path: Path = Path(".env")) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        value = value.split(" #", 1)[0].strip()  # allow trailing comments
+        os.environ.setdefault(key.strip(), value.strip('"').strip("'"))
 
 
 @dataclass(frozen=True)
@@ -35,8 +36,9 @@ class Settings:
         )
     )
     # Competition limits per daily run: 45 min, 2,000 outbound requests, $10 API cost.
+    # The deadline is 44 min so a request in flight (<= timeout) and the export still end within 45 min.
     max_requests: int = field(default_factory=lambda: int(_env("SIGNALPOST_MAX_REQUESTS", "2000")))
-    max_seconds: float = field(default_factory=lambda: float(_env("SIGNALPOST_MAX_SECONDS", "2700")))
+    max_seconds: float = field(default_factory=lambda: float(_env("SIGNALPOST_MAX_SECONDS", "2640")))
     request_timeout: float = field(default_factory=lambda: float(_env("SIGNALPOST_TIMEOUT", "20")))
     max_retries: int = field(default_factory=lambda: int(_env("SIGNALPOST_MAX_RETRIES", "3")))
     backoff_base: float = field(default_factory=lambda: float(_env("SIGNALPOST_BACKOFF", "1.0")))

@@ -52,6 +52,7 @@ class RunStats:
     outbound_requests: int = 0
     cache_hits: int = 0
     retries: int = 0
+    retry_reasons: dict[str, int] = field(default_factory=dict)
     failures: int = 0
     started_monotonic: float = field(default_factory=time.monotonic)
 
@@ -92,8 +93,10 @@ class BudgetedClient:
 
     # -- requests -----------------------------------------------------------
     def get_json(
-        self, url: str, params: dict[str, Any] | None = None, use_cache: bool = True
+        self, url: str, params: dict[str, Any] | None = None, use_cache: bool = True,
+        max_retries: int | None = None,
     ) -> HttpResult:
+        retries_allowed = self.settings.max_retries if max_retries is None else max_retries
         full_url = f"{url}?{urlencode(params, doseq=True)}" if params else url
         if use_cache and self.cache is not None:
             hit = self.cache.get(full_url, self.settings.cache_ttl_seconds)
@@ -130,15 +133,18 @@ class BudgetedClient:
                         retrieved_at=getattr(resp, "retrieved_at", None) or utcnow_iso(),
                         headers={k.lower(): v for k, v in dict(resp.headers or {}).items()},
                     )
-                    if use_cache and self.cache is not None and status in (200, 404, 410):
+                    # always record what was actually fetched (provenance + offline audit); use_cache only controls reads
+                    if self.cache is not None and status in (200, 404, 410):
                         self.cache.put(result)
                     return result
                 error = f"HTTP {status}"
             attempt += 1
-            if attempt > self.settings.max_retries:
+            if attempt > retries_allowed:
                 self.stats.failures += 1
                 raise SourceUnavailable(f"{full_url}: {error} after {attempt} attempts")
             self.stats.retries += 1
+            reason = ":".join(error.split(":")[:2]) if error.startswith("network") else error
+            self.stats.retry_reasons[reason] = self.stats.retry_reasons.get(reason, 0) + 1
             delay = self._retry_after(resp) or self.settings.backoff_base * (2 ** (attempt - 1))
             delay += random.uniform(0, 0.25 * self.settings.backoff_base)
             remaining = self.settings.max_seconds - self.stats.elapsed_seconds

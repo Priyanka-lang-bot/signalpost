@@ -71,6 +71,14 @@ CREATE TABLE IF NOT EXISTS dataset_progress (
     completed_at TEXT NOT NULL,
     PRIMARY KEY (job, page)
 );
+CREATE TABLE IF NOT EXISTS group_checks (
+    orgnr TEXT NOT NULL,
+    grp TEXT NOT NULL,            -- roles | financials
+    outcome TEXT NOT NULL,        -- found | none (source has no data) | failed
+    detail TEXT,
+    checked_at TEXT NOT NULL,
+    PRIMARY KEY (orgnr, grp)
+);
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,
@@ -79,6 +87,11 @@ CREATE TABLE IF NOT EXISTS runs (
     stats_json TEXT
 );
 """
+
+
+def _relation_group(relation: str) -> str:
+    """Which fetched group a related-entity link comes from."""
+    return "entity" if relation == "parent_unit" else "roles"
 
 
 def _dump(v: Any) -> str:
@@ -133,6 +146,14 @@ class Store:
         now = utcnow_iso()
         stored = self.stored_facts(profile.orgnr)
         changes: list[Change] = []
+        # Related entities follow the same rule as facts: those from a group that was not
+        # fetched this time (e.g. auditor links when roles were skipped) are kept as stored.
+        related = [r.model_dump() for r in profile.related_entities if _relation_group(r.relation) in groups]
+        prev = self.conn.execute("SELECT related_json FROM companies WHERE orgnr=?", (profile.orgnr,)).fetchone()
+        if prev is not None:
+            related = [r for r in json.loads(prev[0]) if _relation_group(r["relation"]) not in groups] + related
+        seen: set[tuple] = set()
+        related = [r for r in related if not ((r["relation"], r["orgnr"]) in seen or seen.add((r["relation"], r["orgnr"])))]
         cur = self.conn.cursor()
         cur.execute(
             """INSERT INTO companies(orgnr, entity_kind, registry_state, name, first_seen_at, last_checked_at,
@@ -143,7 +164,7 @@ class Store:
                  last_checked_at=excluded.last_checked_at, related_json=excluded.related_json,
                  unknown_json=excluded.unknown_json""",
             (profile.orgnr, profile.entity_kind, profile.registry_state, profile.value("name"), now, now,
-             _dump([r.model_dump() for r in profile.related_entities]), _dump(profile.unknown_fields)),
+             _dump(related), _dump(profile.unknown_fields)),
         )
         incoming = {f.field: f for f in profile.facts if f.status == FactStatus.VERIFIED}
         for name, fact in incoming.items():
@@ -232,6 +253,84 @@ class Store:
     def orgnrs_checked_before(self, iso_time: str) -> list[str]:
         return [r[0] for r in self.conn.execute(
             "SELECT orgnr FROM companies WHERE last_checked_at < ? ORDER BY last_checked_at, orgnr", (iso_time,))]
+
+    # -- enrichment bookkeeping ----------------------------------------------------
+    _GROUP_FACT = {"roles": "roles", "financials": "financials.period_end"}
+
+    # A company whose source keeps failing (e.g. the accounts API answers HTTP 500 for banks
+    # and insurers) is no longer re-requested after this many consecutive failed runs.
+    PERSISTENT_FAILURE_RUNS = 3
+
+    def mark_group(self, orgnr: str, grp: str, outcome: str, detail: str | None = None) -> None:
+        """Record found | none | failed | skipped for one company's roles/financials group."""
+        prev = self.conn.execute("SELECT outcome, detail FROM group_checks WHERE orgnr=? AND grp=?",
+                                 (orgnr, grp)).fetchone()
+        prev_n = 0
+        if prev is not None and prev[0] in ("failed", "skipped") and prev[1]:
+            try:
+                prev_n = int(json.loads(prev[1]).get("consecutive_failed_runs", 0))
+            except (ValueError, AttributeError):
+                prev_n = 0
+        n = prev_n + 1 if outcome == "failed" else prev_n if outcome == "skipped" else 0
+        info = {"reason": detail or "", "consecutive_failed_runs": n}
+        self.conn.execute("INSERT OR REPLACE INTO group_checks VALUES (?,?,?,?,?)",
+                          (orgnr, grp, outcome, json.dumps(info, ensure_ascii=False), utcnow_iso()))
+        self.conn.commit()
+
+    def group_check(self, orgnr: str, grp: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT outcome, detail, checked_at FROM group_checks WHERE orgnr=? AND grp=?",
+                                (orgnr, grp)).fetchone()
+        if row is None:
+            return None
+        try:
+            info = json.loads(row[1]) if row[1] else {}
+        except ValueError:
+            info = {"reason": row[1]}  # rows written before details were JSON
+        if not isinstance(info, dict):
+            info = {"reason": str(info)}
+        return {"outcome": row[0], "checked_at": row[2], **info}
+
+    def _persistent_failures(self, grp: str) -> set[str]:
+        out = set()
+        for orgnr, detail in self.conn.execute(
+                "SELECT orgnr, detail FROM group_checks WHERE grp=? AND outcome='failed'", (grp,)):
+            try:
+                if int(json.loads(detail or "{}").get("consecutive_failed_runs", 0)) >= self.PERSISTENT_FAILURE_RUNS:
+                    out.add(orgnr)
+            except (ValueError, AttributeError):
+                pass
+        return out
+
+    def orgnrs_needing(self, grp: str) -> list[str]:
+        """Registered main entities with no stored facts for `grp`, no conclusive check of it,
+        and fewer than PERSISTENT_FAILURE_RUNS consecutive failed runs."""
+        fact = self._GROUP_FACT[grp]
+        persistent = self._persistent_failures(grp)
+        return [r[0] for r in self.conn.execute(
+            """SELECT c.orgnr FROM companies c
+               WHERE c.entity_kind='enhet' AND c.registry_state='registered'
+                 AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.orgnr=c.orgnr AND f.field=?)
+                 AND NOT EXISTS (SELECT 1 FROM group_checks g WHERE g.orgnr=c.orgnr AND g.grp=?
+                                 AND g.outcome IN ('found','none'))
+               ORDER BY c.orgnr""", (fact, grp)) if r[0] not in persistent]
+
+    def group_status(self, grp: str) -> dict[str, int]:
+        fact = self._GROUP_FACT[grp]
+        q = lambda sql, *a: self.conn.execute(sql, a).fetchone()[0]  # noqa: E731
+        eligible = q("SELECT COUNT(*) FROM companies WHERE entity_kind='enhet' AND registry_state='registered'")
+        with_data = q("SELECT COUNT(DISTINCT orgnr) FROM facts WHERE field=?", fact)
+        no_data = "AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.orgnr=g.orgnr AND f.field=?)"
+        count = lambda outcome: q(f"SELECT COUNT(*) FROM group_checks g WHERE grp=? AND outcome=? {no_data}",  # noqa: E731
+                                  grp, outcome, fact)
+        return {"eligible": eligible, "with_data": with_data, "source_has_none": count("none"),
+                "source_error_last_run": count("failed"), "not_attempted_last_run": count("skipped"),
+                "source_error_persistent": len(self._persistent_failures(grp)),
+                "not_yet_retrieved": len(self.orgnrs_needing(grp))}
+
+    def last_run(self, kind: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT started_at, finished_at, stats_json FROM runs WHERE kind=? ORDER BY id DESC LIMIT 1",
+                                (kind,)).fetchone()
+        return None if row is None else {"started_at": row[0], "finished_at": row[1], **json.loads(row[2] or "{}")}
 
     # -- dataset progress / runs ---------------------------------------------------
     def page_done(self, job: str, page: int) -> bool:

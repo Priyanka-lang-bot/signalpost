@@ -7,10 +7,25 @@ build/
 dist/
 .venv/
 venv/
-data/*.sqlite3
-data/*.sqlite3-*
-# Generated export is committed deliberately once built from live data:
-# data/export/companies.jsonl, data/export/dataset_stats.json, data/export/benchmark.json
+# Local databases anywhere in the tree (the store holds cached raw API responses)
+*.sqlite3
+*.sqlite3-*
+*.db
+# Generated export IS committed deliberately (built from live data):
+# data/export/companies.jsonl, dataset_stats.json, daily_run.json, benchmark.json
 
 # Raw live API captures may contain personal data (e.g. birth dates in roles); never commit
 data/live_captures/
+
+# Secrets and local environment
+.env.*
+!.env.example
+env/
+.venv*/
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+*.log

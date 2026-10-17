@@ -84,8 +84,14 @@ def main(argv: list[str] | None = None) -> int:
 
     e = sub.add_parser("export", help="write companies.jsonl and dataset_stats.json")
     e.add_argument("--out", default="data/export")
+    e.add_argument("--target", type=int, default=1000)
 
-    sub.add_parser("stats", help="print dataset statistics")
+    st = sub.add_parser("stats", help="print dataset statistics")
+    st.add_argument("--target", type=int, default=1000)
+
+    en = sub.add_parser("enrich", help="backfill roles/accounts for stored companies within the request budget")
+    en.add_argument("--reserve", type=int, default=25, help="requests to keep unused")
+    en.add_argument("--limit", type=int)
 
     ig = sub.add_parser("ingest", help="process a verified capture of genuine live API responses")
     ig.add_argument("capture", help="capture JSON file (see sources/replay.py)")
@@ -93,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     ig.add_argument("--sha256", help="expected SHA-256 of the canonical capture; refuse if different")
     ig.add_argument("--json", action="store_true")
 
-    d = sub.add_parser("daily", help="one-command daily run: build to target, refresh, export")
+    d = sub.add_parser("daily", help="one-command daily run: build to target, refresh, enrich, export")
     d.add_argument("--target", type=int, default=1000)
     d.add_argument("--out", default="data/export")
 
@@ -144,20 +150,54 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(dataset.refresh(agent, limit=args.limit, enrich=args.enrich))
             return 0
         if args.cmd == "export":
-            _print_json(dataset.export(agent, Path(args.out)))
-            return 0
+            rep = dataset.export(agent, Path(args.out), target=args.target)
+            _print_json(rep)
+            return 0 if rep["target_met"] else 1
         if args.cmd == "stats":
-            _print_json(dataset.dataset_report(agent))
+            rep = dataset.dataset_report(agent, target=args.target)
+            _print_json(rep)
+            return 0 if rep["target_met"] else 1
+        if args.cmd == "enrich":
+            _print_json(dataset.enrich(agent, reserve=args.reserve, limit=args.limit))
             return 0
         if args.cmd == "daily":
             run_start = utcnow_iso()
-            built = dataset.build(agent, target=args.target)
-            refreshed = (dataset.refresh(agent, checked_before=run_start)
-                         if agent.client.remaining_requests > 50 else {"skipped": "low request budget"})
-            exported = dataset.export(agent, Path(args.out))
-            _print_json({"build": built, "refresh": {k: v for k, v in refreshed.items() if k != "changes"},
-                         "export": exported, "run": agent._run_stats()})
-            return 0 if built["target_met"] else 1
+            stages: dict[str, dict[str, Any]] = {}
+
+            def stage(name: str, fn: Any) -> Any:
+                st = agent.client.stats
+                r0, t0, x0 = st.outbound_requests, st.elapsed_seconds, st.retries
+                out = fn()
+                stages[name] = {"outbound_requests": st.outbound_requests - r0, "retries": st.retries - x0,
+                                "elapsed_seconds": round(st.elapsed_seconds - t0, 2)}
+                return out
+
+            built = stage("build", lambda: dataset.build(agent, target=args.target))
+            refreshed = stage("refresh", lambda: dataset.refresh(agent, checked_before=run_start)
+                              if agent.client.remaining_requests > 50 else {"skipped": "low request budget"})
+            enriched = stage("enrich", lambda: dataset.enrich(agent))
+            exported = stage("export", lambda: dataset.export(agent, Path(args.out), target=args.target))
+            report = {
+                "started_at": run_start, "finished_at": utcnow_iso(),
+                "note": ("'build' statistics are a snapshot taken right after the build stage, before refresh "
+                         "and enrich; 'export' is the final state of the dataset."),
+                "limits": {"max_outbound_requests": agent.settings.max_requests,
+                           "max_seconds": agent.settings.max_seconds,
+                           "external_api_cost_limit_usd": 10.0},
+                "stages": stages,
+                "build": built,
+                "refresh": {k: v for k, v in refreshed.items() if k != "changes"},
+                "enrich": enriched,
+                "export": exported,
+                # measured: counted by the HTTP client; cost: no paid API is called, so 0 by construction
+                "run": {**agent._run_stats(), "external_api_cost_usd_measured": 0.0},
+            }
+            out_file = Path(args.out) / "daily_run.json"
+            out_file.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str) + "\n",
+                                encoding="utf-8", newline="\n")  # UTF-8 without BOM on every OS
+            _print_json(report)
+            print(f"report written to {out_file}", file=sys.stderr)
+            return 0 if exported["target_met"] else 1
         if args.cmd == "benchmark":
             from .benchmark import run_benchmark
             _print_json(run_benchmark(agent, sample=args.sample, out=Path(args.out)))

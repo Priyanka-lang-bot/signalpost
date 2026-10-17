@@ -63,9 +63,9 @@ class BrregSource:
         return SourceRecord(ENHETSREGISTERET, "roles", orgnr, res.body, url, res.url,
                             res.retrieved_at, _last_modified(res))
 
-    def accounts(self, orgnr: str) -> SourceRecord | None:
+    def accounts(self, orgnr: str, max_retries: int | None = None) -> SourceRecord | None:
         url = f"{self.regnskap_base}/{orgnr}"
-        res = self.client.get_json(url)
+        res = self.client.get_json(url, max_retries=max_retries)
         if res.status in (404, 410, 204):
             return None
         if res.status != 200 or not isinstance(res.body, list):

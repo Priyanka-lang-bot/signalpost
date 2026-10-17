@@ -7,6 +7,7 @@ payload and confirm the value really is stated there.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 from .entity_resolution import accounts_items_for
@@ -187,6 +188,9 @@ def extract_roles(rec: SourceRecord) -> tuple[list[Fact], list[RelatedEntity]]:
 
 # -- financials -----------------------------------------------------------------
 
+_ISO_CURRENCY = re.compile(r"^[A-Z]{3}$")
+
+
 def is_number(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
@@ -203,11 +207,25 @@ def extract_financials(requested: str, rec: SourceRecord) -> tuple[list[Fact], l
     def period_end(pair: tuple[int, dict]) -> str:
         return str(get_path(pair[1], ["regnskapsperiode", "tilDato"]) or "")
 
-    idx, item = max(company, key=period_end)
+    latest_end = max(period_end(pair) for pair in company)
+    latest = [pair for pair in company if period_end(pair) == latest_end]
+    idx, item = latest[0]
+    if len(latest) > 1:
+        # Several company filings for the same period: publish only if they agree on the
+        # currency and every published figure; otherwise we cannot tell which one is valid.
+        def signature(it: dict) -> tuple:
+            return (it.get("valuta"), get_path(it, ["regnskapsperiode", "fraDato"]),
+                    *[repr(get_path(it, path)) for _f, path in FINANCIAL_FIELDS])
+        if len({signature(it) for _i, it in latest}) > 1:
+            warnings.append(f"{len(latest)} conflicting SELSKAP filings for period ending {latest_end}; "
+                            "no figures published")
+            return [], warnings
     to_date = get_path(item, ["regnskapsperiode", "tilDato"])
     from_date = get_path(item, ["regnskapsperiode", "fraDato"])
     currency = item.get("valuta")
-    if not isinstance(to_date, str) or not isinstance(currency, str) or len(currency) != 3:
+    # The currency is taken from the SAME filing as the figures, never from another year,
+    # the share-capital field or a default. A missing/odd code means no figures at all.
+    if not isinstance(to_date, str) or not to_date or not isinstance(currency, str) or not _ISO_CURRENCY.match(currency):
         warnings.append("accounts lack a period end or ISO currency; no figures published")
         return [], warnings
 
