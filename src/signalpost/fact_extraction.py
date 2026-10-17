@@ -14,6 +14,8 @@ from .schemas import CompanyProfile, Fact, RelatedEntity
 from .sources.base import SourceRecord
 
 # (output field, json path) for values copied verbatim from an entity record.
+# Field names verified against the official OpenAPI spec (CCR open data v2.0.0,
+# schemas Enhet / Underenhet / SlettetEnhet) and a live response on 2026-10-17.
 ENTITY_FIELDS: list[tuple[str, list[str]]] = [
     ("name", ["navn"]),
     ("legal_form", ["organisasjonsform", "kode"]),
@@ -24,17 +26,31 @@ ENTITY_FIELDS: list[tuple[str, list[str]]] = [
     ("industry_code", ["naeringskode1", "kode"]),
     ("industry_description", ["naeringskode1", "beskrivelse"]),
     ("industry_code_2", ["naeringskode2", "kode"]),
+    ("industry_description_2", ["naeringskode2", "beskrivelse"]),
     ("industry_code_3", ["naeringskode3", "kode"]),
+    ("industry_description_3", ["naeringskode3", "beskrivelse"]),
     ("institutional_sector_code", ["institusjonellSektorkode", "kode"]),
+    ("institutional_sector_description", ["institusjonellSektorkode", "beskrivelse"]),
     ("registered_employees", ["antallAnsatte"]),
+    ("employees_registered_on", ["registreringsdatoAntallAnsatteEnhetsregisteret"]),
     ("registration_date", ["registreringsdatoEnhetsregisteret"]),
+    ("business_register_date", ["registreringsdatoForetaksregisteret"]),
+    ("vat_register_date", ["registreringsdatoMerverdiavgiftsregisteret"]),
     ("founding_date", ["stiftelsesdato"]),
+    ("articles_date", ["vedtektsdato"]),
     ("deletion_date", ["slettedato"]),
+    ("record_class", ["respons_klasse"]),
+    ("part_of_group", ["erIKonsern"]),
+    ("share_capital_amount", ["kapital", "belop"]),
+    ("share_capital_currency", ["kapital", "valuta"]),
+    ("share_capital_type", ["kapital", "type"]),
     ("website", ["hjemmeside"]),
     ("in_business_register", ["registrertIForetaksregisteret"]),
     ("vat_registered", ["registrertIMvaregisteret"]),
     ("bankrupt", ["konkurs"]),
+    ("bankruptcy_date", ["konkursdato"]),
     ("under_liquidation", ["underAvvikling"]),
+    ("liquidation_date", ["underAvviklingDato"]),
     ("under_forced_liquidation", ["underTvangsavviklingEllerTvangsopplosning"]),
     ("last_submitted_accounts_year", ["sisteInnsendteAarsregnskap"]),
     ("parent_orgnr", ["overordnetEnhet"]),
@@ -91,6 +107,8 @@ def extract_entity(rec: SourceRecord) -> CompanyProfile:
         v = get_path(p, path)
         if v is MISSING or v is None or v == "":
             continue
+        if field == "registered_employees" and p.get("harRegistrertAntallAnsatte") is False:
+            continue  # register says no employee count is registered
         facts.append(_fact(rec, field, v, path))
     related: list[RelatedEntity] = []
     parent = p.get("overordnetEnhet")
@@ -98,7 +116,7 @@ def extract_entity(rec: SourceRecord) -> CompanyProfile:
         related.append(RelatedEntity(relation="parent_unit", orgnr=str(parent),
                                      source_url=rec.canonical_url))
     present = {f.field for f in facts}
-    deleted = "slettedato" in p and bool(p.get("slettedato"))
+    deleted = bool(p.get("slettedato")) or str(p.get("respons_klasse", "")).startswith("Slettet")
     unknown = [f for f in CORE_FIELDS if f not in present] if not deleted else []
     return CompanyProfile(
         orgnr=str(p["organisasjonsnummer"]),
@@ -124,7 +142,12 @@ def derive_roles(payload: Any) -> list[dict[str, Any]]:
             entry: dict[str, Any] = {
                 "role_code": rtype.get("kode"),
                 "role": rtype.get("beskrivelse"),
+                "group": (group.get("type") or {}).get("kode"),
+                "group_last_changed": group.get("sistEndret"),
             }
+            elected = (role.get("valgtAv") or {}).get("beskrivelse")
+            if elected:
+                entry["elected_by"] = elected
             person = role.get("person")
             entity = role.get("enhet")
             if isinstance(person, dict):

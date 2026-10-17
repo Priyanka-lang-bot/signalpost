@@ -4,7 +4,11 @@ Evidence-backed company intelligence for Norwegian organisation numbers. Built f
 
 Give Signalpost a 9-digit Norwegian organisation number. It returns verified facts from the official Brønnøysund registers. Every fact carries the source URL that states it, the JSON location of the value, and the retrieval time. Signalpost also stores each snapshot so later runs report what changed.
 
-> **Status (honest):** the code, tests and offline benchmark are complete and passing. The live dataset statistics and live benchmark below are **not yet filled in**. The development sandbox could not reach `data.brreg.no` because its network allowlist refused the connection. Run `python run.py daily` on a networked machine to produce them; the [Results](#8-tests-and-benchmark-results) section says exactly what to paste where.
+> **Status (honest, 2026-10-17):**
+> - ✅ The API was verified against the official OpenAPI spec (*Open Data from the CCR*, v2.0.0) and with live requests.
+> - ✅ A live single-company lookup (Equinor ASA, 923609016) passed the full pipeline with 44/44 facts evidence-checked. See [Live results](#live-results).
+> - ✅ Live check of the dataset queries: **1,000 distinct, checksum-valid companies in 11 requests (8.8 s)**.
+> - ⏳ **The 1,000 profiles are not yet stored in a Signalpost database.** The build environment's proxy blocks `data.brreg.no`, so the live calls above were made from a browser. Run `python run.py daily` on any networked machine to build and store them, then paste `data/export/dataset_stats.json` into section 7.
 
 ---
 
@@ -49,7 +53,66 @@ All sources are from Brønnøysundregistrene, open data under the [NLOD 2.0 lice
 | Enhetsregisteret | `GET …/enheter?page=&size=&…` | Dataset build (limit: `(page+1)*size ≤ 10 000`) and batch refresh |
 | Regnskapsregisteret | `GET https://data.brreg.no/regnskapsregisteret/regnskap/{orgnr}` | Key figures from the latest approved annual accounts |
 
-Endpoints and field names come from Brreg's [API documentation](https://data.brreg.no/enhetsregisteret/api/dokumentasjon/en/index.html) and the official [regnskapsregister-api OpenAPI spec](https://github.com/brreg/regnskapsregister-api). Brreg describes the accounts API as a temporary R&D API that can change without notice. Signalpost therefore validates its output strictly, and a circuit breaker stops calling it after 5 consecutive failures in a run.
+Endpoints, parameters and field names were checked against the official OpenAPI spec, `https://data.brreg.no/enhetsregisteret/api/dokumentasjon/en/openapi.json` (title *Documentation for Open Data from the Central Coordinating Register for Legal Entities (CCR)*, version 2.0.0, server `https://data.brreg.no`, `security: []`). The accounts endpoint was checked against the official [regnskapsregister-api spec](https://github.com/brreg/regnskapsregister-api). All endpoints were then exercised live on 2026-10-17.
+
+**Verified facts about the API:**
+
+| Topic | Spec (v2.0.0) | Observed live |
+|---|---|---|
+| Single entity | `GET /enhetsregisteret/api/enheter/{enhetorgnr}` → 200 `Enhet` or `SlettetEnhet` (discriminator `respons_klasse`), 400 `BadRequest`, 404, 410 `GoneEnhet`, 500 | 200 for 923609016; 404 for a well-formed unknown number; 400 with a `valideringsfeil` body for `12345` |
+| Sub-entity | `GET …/underenheter/{underenhetorgnr}`, same status set; address field `beliggenhetsadresse` | Equinor has 35 sub-entities; fields as specified |
+| Search | `GET …/enheter` with filters such as `organisasjonsform`, `kommunenummer`, `naeringskode`, `organisasjonsnummer` (comma list), plus `sort`, `page`, `size`. Response `Enheter` = `_embedded.enheter[]` + `page{number,size,totalElements,totalPages}` | `organisasjonsnummer=a,b,c` returns only existing matches; `(page+1)*size > 10 000` → HTTP 400, as documented |
+| Bulk | `GET …/enheter/lastned` (gzip JSON), `/csv`, `/regneark`; produced nightly around 05:00 with `etag`/`last-modified` | Not used: 11 search requests are enough for 1,000 |
+| Updates | `GET …/oppdateringer/enheter` (`dato`, `updatedBefore`, `oppdateringsid`, `organisasjonsnummer`, `includeChanges`, `page`, `size`) | Not used yet; a future refresh optimisation |
+| Roles | `GET …/enheter/{orgnr}/roller` → `Roller{rollegrupper[{type,sistEndret,roller[{type,person|enhet,avregistrert,valgtAv?,rekkefolge}]}]}` | Matches; no `fratraadt` field (removed per changelog); `enhet.navn` is an array |
+| Auth | `security: []` on open endpoints; `bearerAuth` (Maskinporten) only on `/autorisert-api/*` | No key needed |
+| Rate limits | **None documented** | No 429 seen across about 20 live calls. Signalpost still spaces requests and caps them at 2,000 |
+| Licence | NLOD 2.0, contact opendata@brreg.no | — |
+| Freshness headers | not specified for single lookups | **No `Last-Modified`/`ETag` on `/enheter/{orgnr}`**, so retrieval time is the freshness signal |
+
+**Fields used** (all copied verbatim, with JSON path):
+- Organisation number: `organisasjonsnummer`. Name: `navn`.
+- Legal form: `organisasjonsform.kode`/`beskrivelse`.
+- Addresses: `forretningsadresse`, `postadresse`, and `beliggenhetsadresse` for sub-entities.
+- Industry: `naeringskode1..3.kode`/`beskrivelse`.
+- Status: `konkurs`, `konkursdato`, `underAvvikling`, `underAvviklingDato`, `underTvangsavviklingEllerTvangsopplosning`, `slettedato`, `respons_klasse`.
+- Dates: `registreringsdatoEnhetsregisteret`, `registreringsdatoForetaksregisteret`, `registreringsdatoMerverdiavgiftsregisteret`, `stiftelsesdato`, `vedtektsdato`.
+- Employees: `antallAnsatte`, used only when `harRegistrertAntallAnsatte` is not `false`.
+- Other: `kapital.*`, `erIKonsern`, `overordnetEnhet`.
+
+The **source URL** attached to each fact is the record's own `_links.self.href`, e.g. `https://data.brreg.no/enhetsregisteret/api/enheter/923609016`. The identity gate requires it to end in the requested number. Live, this held for 1,000/1,000 search results. Brreg describes the accounts API as a temporary R&D API that can change without notice. Signalpost therefore validates its output strictly, and a circuit breaker stops calling it after 5 consecutive failures in a run.
+
+<a id="live-results"></a>
+### Live results (2026-10-17)
+
+**Single lookup.** `GET https://data.brreg.no/enhetsregisteret/api/enheter/923609016` returned **HTTP 200**, `organisasjonsnummer` **923609016**, `navn` **EQUINOR ASA**. The number was independently confirmed by Proff, Bloomberg LEI and utdanning.no. The roles and accounts endpoints also returned 200.
+
+The three responses were captured with `scripts/browser_capture.js`; the canonical-JSON SHA-256 is `2f58c0e4…570a0f`. They were then processed by the unmodified pipeline with `python run.py ingest data/live_captures/923609016.json 923609016 --sha256 …`. Results:
+- outcome `ok`, 44 facts, **44/44 passed evidence re-check**, `unknown_fields: []`, no warnings
+- 14 active roles; one deregistered board member excluded; no birth dates stored
+- auditor Ernst & Young AS (976389387) kept as a **separate** related entity
+- financials taken from **SELSKAP 2025** (USD), with the three KONSERN filings ignored
+- a second run reported "No changes since the previous check"
+
+Fields absent from this record (not applicable): `beliggenhetsadresse`, `slettedato`, `konkursdato`, `underAvviklingDato`, `overordnetEnhet`.
+
+*Transport caveat:* the HTTP calls were made from a browser, because the build sandbox's proxy blocks `data.brreg.no`. On a normal machine, `python run.py company 923609016` makes the same three calls directly.
+
+**Dataset feasibility.** The default queries run live, sorted by organisation number:
+
+| Query | Pages | Total |
+|---|---|---|
+| ASA | 3 | 213 |
+| AS in Oslo (0301) | 8 of 862 | 86,174 |
+
+Totals:
+- 11 requests, all HTTP 200, 8.8 s
+- 1,013 records received → **1,000 distinct, checksum-valid** organisation numbers; 0 duplicates, 0 invalid
+- 1,000/1,000 self-links match
+- missing: `naeringskode1` in 2 records; 0 missing for name, legal form, registration date and address
+- 14 bankrupt, 13 under liquidation
+
+These records were fetched for verification only. **They are not stored in a Signalpost database yet.**
 
 ## 4. Setup
 
@@ -92,6 +155,9 @@ python run.py refresh
 python run.py export            # -> data/export/companies.jsonl, dataset_stats.json
 python run.py stats
 python run.py benchmark --sample 50
+
+# Process a verified capture of live responses (for machines that cannot reach data.brreg.no)
+python run.py ingest data/live_captures/923609016.json 923609016 --sha256 <hash>
 ```
 
 `python -m signalpost.cli …` and `signalpost …` work too after `pip install -e .`.
@@ -110,7 +176,7 @@ Each search page returns full entity records, so 1,000 profiles cost about 10 se
 
 The build report and `data/export/dataset_stats.json` include `companies_stored`, `distinct_orgnrs`, `invalid_orgnrs`, `this_run.duplicates`, `missing_core_fields`, `field_coverage`, `facts_without_provenance`, `with_financials`, failures and the stop reason.
 
-**Actual dataset statistics: NOT YET GENERATED.** Paste `data/export/dataset_stats.json` here after the first live run. Do not claim the 1,000-profile requirement until `target_met` is `true`.
+**Stored-dataset statistics: NOT YET GENERATED.** (Live feasibility is verified; see Live results.) Paste `data/export/dataset_stats.json` here after the first live run. Do not claim the 1,000-profile requirement until `target_met` is `true`.
 
 ## 8. Tests and benchmark results
 
@@ -118,7 +184,7 @@ The build report and `data/export/dataset_stats.json` include `companies_stored`
 python -m pytest -q
 ```
 
-**Measured in this repository:** 57 tests pass. They cover:
+**Measured in this repository:** 64 tests pass. They include v2.0.0 schema behaviour (`respons_klasse` deletions, `harRegistrertAntallAnsatte`, roles without birth dates), replay integrity, and a replay of the genuine Equinor capture. That last test is skipped when the git-ignored capture is absent. They cover:
 - valid and invalid numbers
 - identifier matching
 - similar names with different numbers
@@ -159,7 +225,8 @@ The hard limits cannot be exceeded. The client refuses request 2,001 and any req
 
 ## 11. Limitations and known failure modes
 
-- **Not validated live from the build environment.** The schemas come from official docs and the OpenAPI spec. The roles response shape and the batch filter `organisasjonsnummer=` on search have not been seen live. The parsers are defensive, and the identity gate drops anything not requested. If the batch filter is ignored, refresh falls back to individual lookups, which costs about 1 request per company and stays within budget.
+- The Python HTTP client has not yet made a live call itself: this build environment's proxy blocks `data.brreg.no`. Every endpoint, schema and the batch `organisasjonsnummer=` filter **was** verified live from a browser, and the parser ran on the genuine responses.
+- The default (unsorted) search order is undocumented, so the builder always sends `sort=organisasjonsnummer,ASC` to make resumed paging stable.
 - The accounts API is temporary, covers ordinary accounting regimes only (no banks or insurers), and gives no group figures. Signalpost publishes company figures only.
 - Brreg data has no per-field modification dates. Freshness uses the HTTP `Last-Modified` header when present, otherwise retrieval time.
 - The dataset is a reproducible slice of the register (ASA, then Oslo AS), not a random sample.

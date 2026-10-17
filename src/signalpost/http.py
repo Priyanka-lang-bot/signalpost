@@ -126,7 +126,8 @@ class BudgetedClient:
                         url=full_url,
                         status=status,
                         body=_parse_json(resp),
-                        retrieved_at=utcnow_iso(),
+                        # a replay session supplies the original capture time
+                        retrieved_at=getattr(resp, "retrieved_at", None) or utcnow_iso(),
                         headers={k.lower(): v for k, v in dict(resp.headers or {}).items()},
                     )
                     if use_cache and self.cache is not None and status in (200, 404, 410):

@@ -24,10 +24,14 @@ EXIT = {"ok": 0, "invalid_input": 2, "not_found": 3, "removed_from_registry": 3,
         "identity_mismatch": 4, "source_unavailable": 5, "budget_exceeded": 6}
 
 
-def make_agent(db: str | None = None) -> Agent:
+def make_agent(db: str | None = None, session: Any = None) -> Agent:
     settings = load_settings()
+    if session is not None:  # replay: retrying an uncaptured URL can never succeed
+        from dataclasses import replace
+        settings = replace(settings, max_retries=0, min_interval=0.0)
     store = Store(db or settings.db_path)
-    client = BudgetedClient(settings, cache=store)
+    # a replay session must not read from or write to the HTTP cache
+    client = BudgetedClient(settings, session=session, cache=None if session is not None else store)
     return Agent(settings, store, client)
 
 
@@ -83,6 +87,12 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("stats", help="print dataset statistics")
 
+    ig = sub.add_parser("ingest", help="process a verified capture of genuine live API responses")
+    ig.add_argument("capture", help="capture JSON file (see sources/replay.py)")
+    ig.add_argument("orgnr")
+    ig.add_argument("--sha256", help="expected SHA-256 of the canonical capture; refuse if different")
+    ig.add_argument("--json", action="store_true")
+
     d = sub.add_parser("daily", help="one-command daily run: build to target, refresh, export")
     d.add_argument("--target", type=int, default=1000)
     d.add_argument("--out", default="data/export")
@@ -94,8 +104,28 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     from . import dataset  # local import keeps `company` startup light
 
-    agent = make_agent(args.db)
+    session = None
+    if args.cmd == "ingest":
+        from .sources.replay import CaptureIntegrityError, ReplaySession
+        try:
+            session = ReplaySession.from_file(args.capture, args.sha256)
+        except (CaptureIntegrityError, OSError, ValueError) as exc:
+            print(f"capture rejected: {exc}", file=sys.stderr)
+            return 4
+    agent = make_agent(args.db, session=session)
     try:
+        if args.cmd == "ingest":
+            res = agent.lookup(args.orgnr)
+            res.run["transport"] = {"mode": "replay of live capture", "file": args.capture,
+                                    "sha256": session.sha256, "captured_with": session.capture.get("captured_with"),
+                                    "uncaptured_urls_requested": session.misses}
+            res.run["replayed_requests"] = res.run.pop("outbound_requests", 0)
+            res.run["outbound_requests"] = 0  # replay makes no network calls
+            if args.json:
+                _print_json(res.model_dump(mode="json"))
+            else:
+                _print_human(res)
+            return EXIT[res.outcome]
         if args.cmd == "company":
             res = agent.lookup(args.orgnr, enrich=not args.no_enrich)
             if args.json:
